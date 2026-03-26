@@ -1,0 +1,13 @@
+# Token / secrets
+.env
+*.env
+
+# Exports Excel
+*.xlsx
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
