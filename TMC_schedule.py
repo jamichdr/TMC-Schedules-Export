@@ -2,13 +2,41 @@ import requests
 import pandas as pd
 import time
 import re
+import os
+import getpass
 from collections import Counter
 
 # =============================
 # ⚙️ CONFIGURATION
 # =============================
 BASE = "https://api.eu.cloud.talend.com"
-TOKEN = "################"  # ⚠️ Ton token brut (sans 'Bearer')
+
+def _load_token():
+    """Charge le token depuis la variable d'env TMC_TOKEN, un fichier .env, ou la saisie interactive."""
+    # 1. Variable d'environnement
+    token = os.environ.get("TMC_TOKEN", "").strip()
+    if token and not token.startswith("#"):
+        return token
+
+    # 2. Fichier .env dans le répertoire courant
+    env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.isfile(env_file):
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("TMC_TOKEN="):
+                    token = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if token:
+                        return token
+
+    # 3. Saisie interactive (masquée)
+    print("⚠️  Token TMC non trouvé dans TMC_TOKEN ou .env")
+    token = getpass.getpass("🔑 Entre ton token Talend Cloud (Bearer) : ").strip()
+    if not token:
+        raise SystemExit("❌ Token vide — arrêt du script.")
+    return token
+
+TOKEN = _load_token()
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
 
@@ -44,6 +72,8 @@ def fetch_projects():
 def fetch_workspaces():
     print("\n🔍 Récupération des workspaces (v2.6 endpoint global)...")
     ws_data = http_get(f"{BASE}/orchestration/workspaces?limit=200")
+    if not ws_data:
+        return []
     ws_items = ws_data.get("items", []) if isinstance(ws_data, dict) else (ws_data or [])
     workspaces = []
     for w in ws_items:
@@ -86,7 +116,7 @@ def fetch_tasks(environment_id):
     all_data, offset = [], 0
     print(f"\n🔄 Récupération des tasks ({environment_id})...")
     while True:
-        url = f"{BASE}/processing/executables/tasks?limit=100&offset={offset}&environmentId={environment_id}"
+        url = f"{BASE}/orchestration/executables/tasks?limit=100&offset={offset}&environmentId={environment_id}"
         data = http_get(url)
         items = (data or {}).get("items", []) if isinstance(data, dict) else (data or [])
         if not items:
@@ -154,7 +184,7 @@ def map_workspaces_to_projects(workspaces, project_map):
         env_name = (w["environment_name"] or "")
         matched_project = None
         for pname in project_map.values():
-            if ws_name in pname.upper():
+            if pname and ws_name in pname.upper():
                 matched_project = pname
                 break
         workspace_project_map[w["workspace_id"]] = matched_project or "Inconnu"
@@ -166,7 +196,6 @@ def map_workspaces_to_projects(workspaces, project_map):
 # =============================
 # 🕒 LECTURE CRON (v3.5 améliorée)
 # =============================
-import re
 
 def _uniform_step(int_list):
     """Retourne le pas si la liste a un écart constant, sinon None."""
@@ -188,7 +217,28 @@ def readable_cron(expr: str) -> str:
         return ""
     expr = expr.strip()
 
+    # ----- Normalisation : champ année wildcard (6 champs → 5 champs) -----
+    # ex: "30 4 ? * 2-6 *" → "30 4 ? * 2-6"
+    parts = expr.split()
+    if len(parts) == 6 and parts[-1] in ('*', '?'):
+        expr = ' '.join(parts[:5])
+
+    # ----- Normalisation : dom=* mois=* dow=? → dom=? mois=* dow=* -----
+    # ex: "00 20 * * ?"  /  "3,8,13 * * * ?" → formes gérées par les regex suivantes
+    parts = expr.split()
+    if len(parts) == 5 and parts[2] == '*' and parts[3] == '*' and parts[4] == '?':
+        parts[2] = '?'
+        parts[4] = '*'
+        expr = ' '.join(parts)
+
     # ----- Cas spéciaux Talend : fin / jour ouvré de mois -----
+    if re.search(r"\bL\b", expr) and not re.search(r"\bL[-W]", expr):
+        # ex. "5 0 L * ?" → le dernier jour du mois à 00:05
+        m = re.match(r"^(\d{1,2})\s+(\d{1,2})\s+L\s+\*\s+\?", expr)
+        if m:
+            minute, hour = map(int, m.groups())
+            return f"Le dernier jour du mois à {hour:02d}h{minute:02d}"
+        return "Le dernier jour du mois"
     if re.search(r"\bL-1\b", expr):
         # ex. "5 0 L-1 * ?" → le dernier jour du mois à 00:05
         m = re.match(r"^(\d{1,2})\s+(\d{1,2})\s+L-1\s+\*\s+\?", expr)
@@ -309,22 +359,32 @@ def readable_cron(expr: str) -> str:
 # 🔢 CLASSIFICATION
 # =============================
 def classify_schedule(desc):
-    if "5 minutes" in desc:
+    dl = desc.lower()
+    if "5 min" in dl:
         return "Every 5min"
-    if "10 minutes" in desc:
+    if "10 min" in dl:
         return "Every 10min"
-    if "semaine" in desc:
-        return "Weekly"
-    if "Tous les jours" in desc:
+    if re.search(r"toutes les \d+ min", dl):
+        return "Recurring"
+    if "aux minutes" in dl or ("chaque" in dl and "min" in dl):
+        return "Recurring"
+    if "mois" in dl or "mensuel" in dl:
+        return "Monthly"
+    if "tous les jours" in dl or "quotidien" in dl:
         return "Daily"
+    if "semaine" in dl:
+        return "Weekly"
     return "Others"
 
 
 def hour_from_cron(expr):
     try:
-        nums = re.findall(r"\b(\d{1,2})\b", expr)
-        if len(nums) >= 2:
-            return int(nums[1])
+        parts = expr.strip().split()
+        if len(parts) >= 2:
+            h = parts[1]
+            m = re.match(r"(\d+)", h)
+            if m:
+                return int(m.group(1))
     except Exception:
         pass
     return None
@@ -373,7 +433,7 @@ def build_dataframe(artifacts, schedules, tasks, plans, workspace_id, workspace_
                 "Projet": project_name,
                 "Workspace": workspace,
                 "Type exécutable": "PLAN" if is_plan else "TASK",
-                "Nom": plan.get("name") if is_plan else task.get("name", ""),
+                "Nom": plan.get("name", "") if is_plan else task.get("name", ""),
                 "Job / Artefact": artifact.get("name", "") if not is_plan else "",
                 "Expression CRON": cron_expr,
                 "Description": desc,
@@ -389,7 +449,9 @@ def build_dataframe(artifacts, schedules, tasks, plans, workspace_id, workspace_
 # 📈 EXPORT
 # =============================
 def export_excel(df, project, env):
-    output = f"tmc_schedules_{project}_{env}.xlsx"
+    safe_project = re.sub(r'[^\w\-]', '_', project)
+    safe_env = re.sub(r'[^\w\-]', '_', env)
+    output = f"tmc_schedules_{safe_project}_{safe_env}.xlsx"
     print(f"\n💾 Génération du fichier Excel : {output}")
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
